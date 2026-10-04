@@ -61,6 +61,9 @@ async def _call_next_checked_in(db, queue_id: int, after_sequence: int):
 
 
 async def expire_due_tickets():
+    """Обработка тикетов CALLED и WAITING, у которых истек срок (5 минут для CALLED, 2 часа для WAITING),
+    а также число попыток для CALLED: 1 - вызов след-го либо +5 минут, 2 - статус WAITING + 2 часа,
+    3 - EXPIRED"""
     async with SessionLocal() as db:
         now = datetime.now(timezone.utc)
 
