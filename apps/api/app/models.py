@@ -32,6 +32,7 @@ class Service(Base):
     name: Mapped[str]=mapped_column(String(160))
     avg_duration_minutes: Mapped[int]=mapped_column(Integer, default=30)
     active: Mapped[bool]=mapped_column(Boolean, default=True)
+    capacity: Mapped[int] = mapped_column(Integer, default=1)
 
 class Queue(Base):
     __tablename__="queues"

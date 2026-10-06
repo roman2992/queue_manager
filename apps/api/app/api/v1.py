@@ -7,11 +7,16 @@ from app.api.dependencies import current_user, require_admin
 from app.core.database import get_db
 from app.core.security import hash_password, verify_password, create_access_token
 from app.models import User, Business, Service, Queue, Ticket, TicketStatus, Role
+from app.queue_logic import fill_available_slots
 
 router=APIRouter()
 class AuthIn(BaseModel): phone:str; password:str=Field(min_length=6); role:Role=Role.CUSTOMER
 class BusinessIn(BaseModel): name:str; address:str|None=None; latitude:float|None=None; longitude:float|None=None
-class ServiceIn(BaseModel): name:str; avg_duration_minutes:int=30
+class ServiceIn(BaseModel):
+    name:str;
+    avg_duration_minutes:int=30;
+    capacity: int = Field(default=1, ge=1);
+
 class TicketOut(BaseModel): id:int; queue_sequence:int; status:str; people_ahead:int; expires_at:datetime|None
 
 @router.post("/auth/register")
@@ -32,10 +37,10 @@ async def login(data:AuthIn, db:AsyncSession=Depends(get_db)):
 
 @router.post("/admin/businesses")
 async def create_business(data:BusinessIn,user=Depends(require_admin),db:AsyncSession=Depends(get_db)):
-    b=Business(owner_id=user.id,**data.model_dump());
-    db.add(b);
-    await db.commit();
-    await db.refresh(b);
+    b=Business(owner_id=user.id,**data.model_dump())
+    db.add(b)
+    await db.commit()
+    await db.refresh(b)
     return b
 
 @router.post("/admin/businesses/{business_id}/services")
@@ -192,17 +197,21 @@ async def cancel_ticket(
             Ticket.user_id == user.id,
         )
     )
+
     if queue_id is None:
         raise HTTPException(404, "Ticket not found")
 
+    # Сначала блокируем Queue.
     queue = await db.scalar(
         select(Queue)
         .where(Queue.id == queue_id)
         .with_for_update()
     )
+
     if not queue:
         raise HTTPException(404, "Queue not found")
 
+    # Затем блокируем Ticket.
     t = await db.scalar(
         select(Ticket)
         .where(
@@ -222,13 +231,15 @@ async def cancel_ticket(
     ):
         raise HTTPException(400, "Ticket cannot be cancelled")
 
-    #was_called = t.status == TicketStatus.CALLED.value
     now = datetime.now(timezone.utc)
+
     t.status = TicketStatus.CANCELLED.value
     t.resolved_at = now
     t.resolved_reason = "CANCELLED"
     t.expires_at = None
 
+    # Проверяем, остался ли кто-нибудь активный перед
+    # отменённым талоном.
     earlier_active = await db.scalar(
         select(Ticket.id)
         .where(
@@ -244,38 +255,33 @@ async def cancel_ticket(
         .limit(1)
     )
 
+    # Если перед отменённым талоном больше никого нет,
+    # ближайшему WAITING запускаем срок прибытия.
     if not earlier_active:
-        next_ticket = await db.scalar(
+        next_waiting = await db.scalar(
             select(Ticket)
             .where(
                 Ticket.queue_id == queue_id,
                 Ticket.queue_sequence > t.queue_sequence,
-                Ticket.status.in_([
-                    TicketStatus.WAITING.value,
-                    TicketStatus.CHECKED_IN.value,
-                    TicketStatus.CALLED.value,
-                    TicketStatus.IN_SERVICE.value,
-                ]),
+                Ticket.status == TicketStatus.WAITING.value,
+                Ticket.expires_at.is_(None),
             )
             .order_by(Ticket.queue_sequence)
             .limit(1)
             .with_for_update()
         )
 
-        if next_ticket:
-            if (
-                    next_ticket.status == TicketStatus.WAITING.value
-                    and next_ticket.expires_at is None
-            ):
-                next_ticket.expires_at = now + timedelta(hours=2)
+        if next_waiting:
+            next_waiting.expires_at = now + timedelta(hours=2)
 
-            elif next_ticket.status == TicketStatus.CHECKED_IN.value:
-                next_ticket.status = TicketStatus.CALLED.value
-                next_ticket.called_at = now
-                next_ticket.call_attempts += 1
-                next_ticket.expires_at = now + timedelta(minutes=5)
-
-
+    # Если отменённый талон был CALLED, освободился
+    # сервисный слот. Также здесь корректно заполняются
+    # любые другие свободные слоты.
+    called = await fill_available_slots(
+        db=db,
+        queue=queue,
+        now=now,
+    )
 
     await db.commit()
 
@@ -283,8 +289,15 @@ async def cancel_ticket(
         "ticket_id": t.id,
         "status": t.status,
         "resolved_at": t.resolved_at,
+        "called": [
+            {
+                "ticket_id": ticket.id,
+                "queue_sequence": ticket.queue_sequence,
+                "status": ticket.status,
+            }
+            for ticket in called
+        ],
     }
-
 
 async def _owned_queue(queue_id:int,user,db):
     q=await db.scalar(select(Queue).join(Service,Queue.service_id==Service.id).join(Business,Business.id==Service.business_id).where(Queue.id==queue_id,Business.owner_id==user.id))
@@ -305,106 +318,51 @@ async def call_next(
 ):
     q = await _owned_queue(queue_id, user, db)
 
-    # Serialize calls within this queue.
-    q = await db.scalar(
+    queue = await db.scalar(
         select(Queue)
         .where(Queue.id == q.id)
         .with_for_update()
     )
 
-    already_called = await db.scalar(
-        select(Ticket.id)
-        .where(
-            Ticket.queue_id == q.id,
-            Ticket.status == TicketStatus.CALLED.value,
-        )
-        .limit(1)
+    if not queue:
+        raise HTTPException(404, "Queue not found")
+
+    called = await fill_available_slots(
+        db=db,
+        queue=queue,
     )
 
-    if already_called:
-        raise HTTPException(409, "A ticket is already called")
-
-
-    candidates = (
-        await db.scalars(
-            select(Ticket)
-            .where(
-                Ticket.queue_id == q.id,
-                Ticket.status == TicketStatus.CHECKED_IN.value,
-            )
-            .order_by(Ticket.queue_sequence)
-            .with_for_update()
+    if not called:
+        raise HTTPException(
+            409,
+            "No service slot or checked-in tickets available",
         )
-    ).all()
-
-    if not candidates:
-        raise HTTPException(409, "No checked-in tickets available")
-
-    # Select the first customer not marked to be skipped.
-    t = next(
-        (item for item in candidates if not item.skip_once),
-        None,
-    )
-
-    if t:
-        # Clear the one-time skip for customers bypassed this time.
-        # в чем смысл?
-        for item in candidates:
-            if item.queue_sequence >= t.queue_sequence:
-                break
-            if item.skip_once:
-                item.skip_once = False
-    else:
-        # All candidates are marked: call the earliest to avoid
-        # leaving the queue stuck.
-        t = candidates[0]
-        t.skip_once = False
-
-    now = datetime.now(timezone.utc)
-
-    t.status = TicketStatus.CALLED.value
-    t.called_at = now
-    t.call_attempts += 1
-    t.expires_at = now + timedelta(minutes=5)
 
     await db.commit()
 
     return {
-        "ticket_id": t.id,
-        "sequence": t.queue_sequence,
-        "status": t.status,
-        "call_attempts": t.call_attempts,
-        "expires_at": t.expires_at,
+        "queue_id": queue.id,
+        "called": [
+            {
+                "ticket_id": ticket.id,
+                "queue_sequence": ticket.queue_sequence,
+                "status": ticket.status,
+            }
+            for ticket in called
+        ],
     }
 
-
 @router.post("/admin/tickets/{ticket_id}/start")
-async def start_ticket(ticket_id:int,user=Depends(require_admin),db:AsyncSession=Depends(get_db)):
-    t=await db.scalar(
-        select(Ticket).join(Queue,Ticket.queue_id==Queue.id)
-        .join(Service,Queue.service_id==Service.id)
-        .join(Business,Business.id==Service.business_id)
-        .where(Ticket.id==ticket_id,Business.owner_id==user.id)
-        .with_for_update())
-    if not t or t.status != TicketStatus.CALLED.value:
-        raise HTTPException(400,"Ticket cannot be started")
-    t.status=TicketStatus.IN_SERVICE.value;
-    t.service_started_at=datetime.now(timezone.utc);
-    t.expires_at = None
-    await db.commit();
-    return {"ticket_id":t.id,"status":t.status}
-
-
-@router.post("/admin/tickets/{ticket_id}/complete")
-async def complete_ticket(
+async def start_ticket(
     ticket_id: int,
     user=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    # Получаем queue_id, чтобы сначала заблокировать очередь
     queue_id = await db.scalar(
-        select(Ticket.queue_id).where(Ticket.id == ticket_id)
+        select(Ticket.queue_id)
+        .where(Ticket.id == ticket_id)
     )
+
     if queue_id is None:
         raise HTTPException(404, "Ticket not found")
 
@@ -413,10 +371,84 @@ async def complete_ticket(
         .where(Queue.id == queue_id)
         .with_for_update()
     )
+
     if not queue:
         raise HTTPException(404, "Queue not found")
 
-    # Проверяем владельца и блокируем талон после блокировки очереди
+    t = await db.scalar(
+        select(Ticket)
+        .join(Queue, Ticket.queue_id == Queue.id)
+        .join(Service, Queue.service_id == Service.id)
+        .join(Business, Business.id == Service.business_id)
+        .where(
+            Ticket.id == ticket_id,
+            Business.owner_id == user.id,
+        )
+        .with_for_update()
+    )
+
+    if not t or t.status != TicketStatus.CALLED.value:
+        raise HTTPException(400, "Ticket cannot be started")
+
+    occupied = await db.scalar(
+        select(func.count(Ticket.id))
+        .where(
+            Ticket.queue_id == queue.id,
+            Ticket.status.in_([
+                TicketStatus.CALLED.value,
+                TicketStatus.IN_SERVICE.value,
+            ]),
+        )
+    )
+
+    capacity = await db.scalar(
+        select(Service.capacity)
+        .where(Service.id == queue.service_id)
+    )
+
+    if capacity is None or (occupied or 0) > capacity:
+        raise HTTPException(409, "Service capacity exceeded")
+
+    now = datetime.now(timezone.utc)
+
+    t.status = TicketStatus.IN_SERVICE.value
+    t.service_started_at = now
+    t.expires_at = None
+
+    await db.commit()
+
+    return {
+        "ticket_id": t.id,
+        "status": t.status,
+    }
+
+
+@router.post("/admin/tickets/{ticket_id}/complete")
+async def complete_ticket(
+    ticket_id: int,
+    user=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    # Сначала блокируем очередь — это сериализует изменения capacity
+    # внутри одной очереди.
+    queue_id = await db.scalar(
+        select(Ticket.queue_id)
+        .where(Ticket.id == ticket_id)
+    )
+
+    if queue_id is None:
+        raise HTTPException(404, "Ticket not found")
+
+    queue = await db.scalar(
+        select(Queue)
+        .where(Queue.id == queue_id)
+        .with_for_update()
+    )
+
+    if not queue:
+        raise HTTPException(404, "Queue not found")
+
+    # После блокировки Queue блокируем сам Ticket.
     t = await db.scalar(
         select(Ticket)
         .join(Queue, Ticket.queue_id == Queue.id)
@@ -433,37 +465,37 @@ async def complete_ticket(
         raise HTTPException(400, "Ticket cannot be completed")
 
     now = datetime.now(timezone.utc)
+
     t.status = TicketStatus.COMPLETED.value
     t.completed_at = now
     t.resolved_at = now
     t.resolved_reason = "COMPLETED"
 
-    # Находим следующего активного клиента в очереди
-    next_ticket = await db.scalar(
+    # Если впереди есть WAITING-клиент, который ещё не начал
+    # ожидание прибытия, запускаем ему 2-часовой срок.
+    next_waiting = await db.scalar(
         select(Ticket)
         .where(
             Ticket.queue_id == queue_id,
             Ticket.queue_sequence > t.queue_sequence,
-            Ticket.status.in_([
-                TicketStatus.WAITING.value,
-                TicketStatus.CHECKED_IN.value,
-                TicketStatus.CALLED.value,
-                TicketStatus.IN_SERVICE.value,
-            ]),
+            Ticket.status == TicketStatus.WAITING.value,
+            Ticket.expires_at.is_(None),
         )
         .order_by(Ticket.queue_sequence)
         .limit(1)
         .with_for_update()
     )
 
-    # Если следующий клиент ещё не прошёл Check-in,
-    # запускаем ему 2-часовой срок прибытия
-    if (
-        next_ticket
-        and next_ticket.status == TicketStatus.WAITING.value
-        and next_ticket.expires_at is None
-    ):
-        next_ticket.expires_at = now + timedelta(hours=2)
+    if next_waiting:
+        next_waiting.expires_at = now + timedelta(hours=2)
+
+    # Освободился один сервисный слот.
+    # Заполняем его самым ранним CHECKED_IN клиентом.
+    called = await fill_available_slots(
+        db=db,
+        queue=queue,
+        now=now,
+    )
 
     await db.commit()
 
@@ -471,4 +503,12 @@ async def complete_ticket(
         "ticket_id": t.id,
         "status": t.status,
         "resolved_at": t.resolved_at,
+        "called": [
+            {
+                "ticket_id": ticket.id,
+                "queue_sequence": ticket.queue_sequence,
+                "status": ticket.status,
+            }
+            for ticket in called
+        ],
     }
