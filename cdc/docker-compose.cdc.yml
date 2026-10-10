@@ -1,0 +1,74 @@
+
+services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+
+  target-postgres:
+    image: postgis/postgis:17-3.5
+    environment:
+      POSTGRES_DB: queue_manager_replica
+      POSTGRES_USER: replica_user
+      POSTGRES_PASSWORD: ${TARGET_DB_PASSWORD:?Set TARGET_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - cdc_target_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U replica_user -d queue_manager_replica
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - cdc_kafka_data:/var/lib/kafka/data
+
+  connect:
+    build:
+      context: ./cdc/connect
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: queue-manager-connect
+      CONFIG_STORAGE_TOPIC: _queue_manager_connect_configs
+      OFFSET_STORAGE_TOPIC: _queue_manager_connect_offsets
+      STATUS_STORAGE_TOPIC: _queue_manager_connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "true"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
+    ports:
+      - "127.0.0.1:8083:8083"
+    depends_on:
+      - kafka
+      - postgres
+      - target-postgres
+
+volumes:
+  cdc_target_data:
+  cdc_kafka_data:

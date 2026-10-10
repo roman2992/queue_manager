@@ -1,0 +1,21 @@
+
+{
+  "name": "queue-manager-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "12345",
+    "database.dbname": "queue_manager",
+    "topic.prefix": "queue_manager",
+    "plugin.name": "pgoutput",
+    "slot.name": "queue_manager_cdc_slot",
+    "publication.name": "dbz_publication",
+    "publication.autocreate.mode": "disabled",
+    "schema.include.list": "public",
+    "table.include.list": "public\\..*",
+    "snapshot.mode": "initial"
+  }
+}

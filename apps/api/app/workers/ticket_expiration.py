@@ -6,6 +6,7 @@ from sqlalchemy import select
 from app.core.database import SessionLocal
 from app.models import Queue, Ticket, TicketStatus
 
+from app.queue_logic import fill_available_slots
 
 ACTIVE_STATUSES = [
     TicketStatus.WAITING.value,
@@ -88,11 +89,14 @@ async def expire_due_tickets():
 
         for ticket_id, queue_id in due_rows:
             # Serialize worker transitions within a queue.
-            await db.scalar(
+            queue = await db.scalar(
                 select(Queue)
                 .where(Queue.id == queue_id)
                 .with_for_update()
             )
+
+            if not queue:
+                continue
 
             ticket = await db.scalar(
                 select(Ticket)
@@ -127,25 +131,27 @@ async def expire_due_tickets():
                 continue
 
             # CALLED: the five-minute service-start window expired.
+            # Release the reserved service slot before promoting anyone.
             attempt = ticket.call_attempts
-            next_ticket = None
-
-            if attempt in (1, 2, 3):
-                next_ticket = await _call_next_checked_in(
-                    db,
-                    ticket.queue_id,
-                    ticket.queue_sequence,
-                )
 
             if attempt == 1:
-                if next_ticket:
-                    # Keep the customer checked in, but bypass them once.
-                    ticket.status = TicketStatus.CHECKED_IN.value
-                    ticket.skip_once = True
-                    ticket.expires_at = None
-                else:
-                    # Nobody is waiting behind them: make the second call.
+                # First failed call: return this ticket to CHECKED_IN,
+                # but skip it once if another checked-in client is available.
+                ticket.status = TicketStatus.CHECKED_IN.value
+                ticket.expires_at = None
+                ticket.skip_once = True
+
+                called = await fill_available_slots(
+                    db=db,
+                    queue=queue,
+                    now=now,
+                )
+
+                if not called:
+                    # Nobody else could take the slot. Call the same
+                    # customer for their second attempt.
                     ticket.status = TicketStatus.CALLED.value
+                    ticket.skip_once = False
                     ticket.called_at = now
                     ticket.call_attempts = 2
                     ticket.expires_at = now + timedelta(minutes=5)
@@ -156,6 +162,13 @@ async def expire_due_tickets():
                 ticket.expires_at = now + timedelta(hours=2)
                 ticket.resolved_reason = None
                 ticket.resolved_at = None
+                ticket.skip_once = False
+
+                await fill_available_slots(
+                    db=db,
+                    queue=queue,
+                    now=now,
+                )
 
             else:
                 # Third failed call (or any later call).
@@ -163,6 +176,13 @@ async def expire_due_tickets():
                 ticket.resolved_at = now
                 ticket.resolved_reason = "CALL_TIMEOUT"
                 ticket.expires_at = None
+                ticket.skip_once = False
+
+                await fill_available_slots(
+                    db=db,
+                    queue=queue,
+                    now=now,
+                )
 
             processed += 1
 

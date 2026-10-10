@@ -1,0 +1,20 @@
+
+{
+  "name": "queue-manager-sink",
+  "config": {
+    "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+    "tasks.max": "1",
+    "connection.url": "jdbc:postgresql://target-postgres:5432/queue_manager_replica",
+    "connection.username": "replica_user",
+    "connection.password": "12345",
+    "topics.regex": "queue_manager\\.public\\..*",
+    "insert.mode": "upsert",
+    "primary.key.mode": "record_key",
+    "delete.enabled": "true",
+    "schema.evolution": "basic",
+    "transforms": "route",
+    "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.route.regex": "queue_manager\\.public\\.(.*)",
+    "transforms.route.replacement": "$1"
+  }
+}

@@ -238,40 +238,33 @@ async def cancel_ticket(
     t.resolved_reason = "CANCELLED"
     t.expires_at = None
 
-    # Проверяем, остался ли кто-нибудь активный перед
-    # отменённым талоном.
-    earlier_active = await db.scalar(
-        select(Ticket.id)
+    # Находим первого WAITING-клиента независимо от состояния таймера.
+    next_waiting = await db.scalar(
+        select(Ticket)
         .where(
             Ticket.queue_id == queue_id,
-            Ticket.queue_sequence < t.queue_sequence,
-            Ticket.status.in_([
-                TicketStatus.WAITING.value,
-                TicketStatus.CHECKED_IN.value,
-                TicketStatus.CALLED.value,
-                TicketStatus.IN_SERVICE.value,
-            ]),
+            Ticket.status == TicketStatus.WAITING.value,
         )
+        .order_by(Ticket.queue_sequence)
         .limit(1)
+        .with_for_update()
     )
 
-    # Если перед отменённым талоном больше никого нет,
-    # ближайшему WAITING запускаем срок прибытия.
-    if not earlier_active:
-        next_waiting = await db.scalar(
-            select(Ticket)
+    if next_waiting:
+        earlier_blocker = await db.scalar(
+            select(Ticket.id)
             .where(
                 Ticket.queue_id == queue_id,
-                Ticket.queue_sequence > t.queue_sequence,
-                Ticket.status == TicketStatus.WAITING.value,
-                Ticket.expires_at.is_(None),
+                Ticket.queue_sequence < next_waiting.queue_sequence,
+                Ticket.status.in_([
+                    TicketStatus.CALLED.value,
+                    TicketStatus.CHECKED_IN.value,
+                ]),
             )
-            .order_by(Ticket.queue_sequence)
             .limit(1)
-            .with_for_update()
         )
 
-        if next_waiting:
+        if earlier_blocker is None and next_waiting.expires_at is None:
             next_waiting.expires_at = now + timedelta(hours=2)
 
     # Если отменённый талон был CALLED, освободился
@@ -471,15 +464,14 @@ async def complete_ticket(
     t.resolved_at = now
     t.resolved_reason = "COMPLETED"
 
-    # Если впереди есть WAITING-клиент, который ещё не начал
-    # ожидание прибытия, запускаем ему 2-часовой срок.
+
+
+    # Находим первого WAITING-клиента независимо от состояния таймера.
     next_waiting = await db.scalar(
         select(Ticket)
         .where(
             Ticket.queue_id == queue_id,
-            Ticket.queue_sequence > t.queue_sequence,
             Ticket.status == TicketStatus.WAITING.value,
-            Ticket.expires_at.is_(None),
         )
         .order_by(Ticket.queue_sequence)
         .limit(1)
@@ -487,7 +479,23 @@ async def complete_ticket(
     )
 
     if next_waiting:
-        next_waiting.expires_at = now + timedelta(hours=2)
+        earlier_blocker = await db.scalar(
+            select(Ticket.id)
+            .where(
+                Ticket.queue_id == queue_id,
+                Ticket.queue_sequence < next_waiting.queue_sequence,
+                Ticket.status.in_([
+                    TicketStatus.CALLED.value,
+                    TicketStatus.CHECKED_IN.value,
+                ]),
+            )
+            .limit(1)
+        )
+
+        if earlier_blocker is None and next_waiting.expires_at is None:
+            next_waiting.expires_at = now + timedelta(hours=2)
+
+
 
     # Освободился один сервисный слот.
     # Заполняем его самым ранним CHECKED_IN клиентом.

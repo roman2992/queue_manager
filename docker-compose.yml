@@ -16,6 +16,14 @@ services:
     depends_on: [postgres, redis]
   postgres:
     image: postgis/postgis:17-3.5
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
     environment:
       POSTGRES_DB: queue_manager
       POSTGRES_USER: queue_manager
