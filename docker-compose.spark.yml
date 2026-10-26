@@ -1,0 +1,47 @@
+﻿services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: >
+      server
+      -dir=/data
+      -s3
+      -s3.port=8333
+      -s3.config=/etc/seaweedfs/s3.json
+      -ip=seaweedfs
+      -ip.bind=0.0.0.0
+    ports:
+      - "127.0.0.1:8333:8333"
+      - "127.0.0.1:9333:9333"
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - seaweedfs_data:/data
+      - ./cdc/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    restart: unless-stopped
+
+  spark-ingest:
+    build:
+      context: ./cdc/spark
+      dockerfile: Dockerfile
+    profiles:
+      - jobs
+    environment:
+      JDBC_URL: jdbc:postgresql://target-postgres:5432/queue_manager_replica
+      DB_USER: replica_user
+      DB_PASSWORD: ${TARGET_DB_PASSWORD}
+      S3_ENDPOINT: http://seaweedfs:8333
+      S3_BUCKET: queue-lake
+      S3_PREFIX: bronze/queue_tickets
+      AWS_ACCESS_KEY_ID: localaccesskey
+      AWS_SECRET_ACCESS_KEY: localsecretkey123
+      AWS_DEFAULT_REGION: us-east-1
+      CHECKPOINT_FILE: /checkpoints/queue_tickets.json
+      LOOKBACK_MINUTES: "5"
+    volumes:
+      - spark_checkpoints:/checkpoints
+    depends_on:
+      - seaweedfs
+    restart: "no"
+
+volumes:
+  seaweedfs_data:
+  spark_checkpoints:
