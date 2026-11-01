@@ -9,8 +9,11 @@ ENV PATH="${JAVA_HOME}/bin:${PATH}"
 ENV PIP_NO_CACHE_DIR=1
 
 RUN python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir --no-deps pyspark==3.5.5
+        && python -m pip install --no-cache-dir pyspark==3.5.5 notebook
 
 WORKDIR /opt/spark-app
 
 COPY ingest.py /opt/spark-app/ingest.py
+CMD ["python", "/opt/spark-app/ingest.py"]
+
+

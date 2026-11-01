@@ -17,7 +17,31 @@
       - seaweedfs_data:/data
       - ./cdc/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
     restart: unless-stopped
-
+  jupyter-spark:
+    build:
+      context: ./cdc/spark
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8889:8888"
+      - "127.0.0.1:4040:4040"
+      - "127.0.0.1:4041:4041"
+    environment:
+      JUPYTER_TOKEN: local-jupyter-token
+      S3_ENDPOINT: http://seaweedfs:8333
+      S3_BUCKET: queue-lake
+      AWS_ACCESS_KEY_ID: localaccesskey
+      AWS_SECRET_ACCESS_KEY: localsecretkey123
+      AWS_DEFAULT_REGION: us-east-1
+    command: >
+      jupyter notebook
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --allow-root
+      --ServerApp.token=local-jupyter-token
+    depends_on:
+      - seaweedfs
+    restart: unless-stopped
   spark-ingest:
     build:
       context: ./cdc/spark
